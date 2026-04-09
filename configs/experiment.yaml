@@ -1,0 +1,86 @@
+model:
+  name: "Qwen/Qwen2.5-0.5B"
+  dtype: "bf16"
+  inference_dtype: "bf16"
+
+deployment:
+  # How many GPUs for each role. Assigned sequentially from GPU 0.
+  # Example with 8 GPUs: num_train_gpus=2, num_infer_gpus=6
+  #   → train on [0,1] with FSDP, infer on [2,3,4,5,6,7] with vLLM
+  # Example with 4 GPUs: num_train_gpus=2, num_infer_gpus=2
+  #   → train on [0,1] with FSDP, infer on [2,3] with vLLM
+  # Example with 2 GPUs: num_train_gpus=1, num_infer_gpus=1
+  #   → train on [0] (no FSDP), infer on [1] with vLLM
+  # When num_train_gpus > 1, FSDP (Fully Sharded Data Parallel) is
+  # automatically enabled. Model params, gradients, and optimizer states
+  # are sharded across training GPUs. Required for models too large for 1 GPU.
+  num_train_gpus: 1
+  num_infer_gpus: 1
+  # fsdp_master_port: 29500  # Port for FSDP process group rendezvous
+
+training:
+  # Algorithm: "ipo" (INTELLECT Policy Optimization, from prime-rl) or "grpo"
+  # IPO is more stable for async RL — uses probability-difference masking
+  # instead of ratio clipping, and quadratic KL regularization.
+  algorithm: "ipo"
+  group_size: 8
+  batch_size: 16
+  lr: 1.0e-6
+  max_steps: 200
+  max_completion_length: 512
+  max_grad_norm: 1.0
+  temperature: 0.7
+  top_p: 0.9
+
+  # IPO-specific params (used when algorithm: "ipo")
+  ipo_mask_low: 0.2       # Mask tokens where prob decreased by more than this
+  ipo_mask_high: 0.2      # Mask tokens where prob increased by more than this
+  adv_tau: 1.0            # Advantage scaling factor
+  kl_tau: 1.0e-3          # Quadratic KL regularization weight
+
+  # GRPO-specific params (used when algorithm: "grpo")
+  clip_eps: 0.2           # PPO-style ratio clipping
+  kl_coeff: 0.01          # KL penalty coefficient
+
+  # FSDP options (only used when num_train_gpus > 1)
+  fsdp_cpu_offload: false
+
+dataset:
+  name: "gsm8k"
+  split: "train"
+
+buffer:
+  type: "sync"
+  maxsize: 4
+
+weight_sync:
+  type: "filesystem"
+  checkpoint_dir: "/tmp/async-rl-lab/checkpoints"
+  bucket_size_mb: 1024
+  zmq_port: 5555
+
+staleness:
+  type: "no_filter"
+  max_lag: 3
+  is_clip_eps: 0.2
+
+interrupt:
+  type: "batch_sync"
+
+scorer:
+  type: "verifier"
+
+metrics:
+  log_every: 1
+  eval_every: 10
+  eval_samples: 200
+  plot_dir: "results/"
+
+wandb:
+  enabled: true              # Log to Weights & Biases
+  project: "async-rl-lab"    # W&B project name
+  # run_name: "ipo-qwen-0.5b"  # Optional run name (auto-generated if omitted)
+  # group: "buffer-comparison"  # Optional group for experiment sweeps
+  # tags: ["ipo", "gsm8k"]     # Optional tags
+
+seed: 42
