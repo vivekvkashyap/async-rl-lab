@@ -17,8 +17,11 @@ class FilesystemSyncer(WeightSyncer):
     via reload_weights(weights_path=...).
     """
 
-    def __init__(self, checkpoint_dir: str, keep_last: int = 2):
+    def __init__(self, checkpoint_dir: str, keep_last: int = 4):
         self.checkpoint_dir = checkpoint_dir
+        # keep_last defaults to 4 so the currently-loading inference process
+        # still has at least 3 older snapshots around during cleanup — avoids
+        # racing against a just-picked directory being removed mid-load.
         self.keep_last = keep_last
         os.makedirs(checkpoint_dir, exist_ok=True)
         self._model_config_copied = False
@@ -27,9 +30,11 @@ class FilesystemSyncer(WeightSyncer):
         return os.path.join(self.checkpoint_dir, f"v{version:06d}")
 
     def _cleanup(self):
-        dirs = sorted(globmod.glob(os.path.join(self.checkpoint_dir, "v*")))
-        while len(dirs) > self.keep_last:
-            shutil.rmtree(dirs.pop(0), ignore_errors=True)
+        # Glob for committed directories only (skip .tmp staging dirs).
+        all_dirs = globmod.glob(os.path.join(self.checkpoint_dir, "v*"))
+        committed = sorted(d for d in all_dirs if not d.endswith(".tmp"))
+        while len(committed) > self.keep_last:
+            shutil.rmtree(committed.pop(0), ignore_errors=True)
 
     def _copy_model_config(self, model, version_dir: str):
         """Copy config.json from the original model so vLLM can reload."""
@@ -63,20 +68,28 @@ class FilesystemSyncer(WeightSyncer):
                     seen_data_ptrs[ptr] = k
                     state_dict[k] = v
 
+        # Stage into a .tmp dir, then atomically rename. Inference only picks
+        # up committed v###### directories, so it never observes a half-written
+        # safetensors file — and the commit is a single atomic rename.
         version_dir = self._version_dir(version)
-        os.makedirs(version_dir, exist_ok=True)
+        staging_dir = version_dir + ".tmp"
+        if os.path.exists(staging_dir):
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        os.makedirs(staging_dir, exist_ok=True)
 
-        safetensors_path = os.path.join(version_dir, "model.safetensors")
+        safetensors_path = os.path.join(staging_dir, "model.safetensors")
         await asyncio.get_event_loop().run_in_executor(
             None, lambda: save_file(state_dict, safetensors_path)
         )
 
-        # Save config so vLLM reload_weights can find model metadata
-        # For FSDP models, access the underlying model's config
         unwrapped = model
         if is_fsdp_wrapped(model):
             unwrapped = model.module
-        self._copy_model_config(unwrapped, version_dir)
+        self._copy_model_config(unwrapped, staging_dir)
+
+        if os.path.exists(version_dir):
+            shutil.rmtree(version_dir, ignore_errors=True)
+        os.rename(staging_dir, version_dir)
 
         self._cleanup()
 

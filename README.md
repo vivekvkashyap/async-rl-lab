@@ -67,7 +67,7 @@ Set `algorithm: "ipo"` or `algorithm: "grpo"` in config.
 
 ```yaml
 model:
-  name: "Qwen/Qwen2.5-0.5B"
+  name: "Qwen/Qwen2.5-0.5B-Instruct"
   dtype: "bf16"
   inference_dtype: "bf16"
 

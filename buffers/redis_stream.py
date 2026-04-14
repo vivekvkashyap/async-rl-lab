@@ -65,17 +65,23 @@ def _dict_to_rollout(d: dict) -> ScoredRollout:
 class RedisStreamBuffer(RolloutBuffer):
     """Unbounded buffer using Redis streams (XADD/XREAD).
 
-    Uses Redis XADD for append and XREAD with blocking for consumption.
-    Consumer tracks its position via last-read message ID.
+    Transport is Redis, not an mp.Queue — so get_producer_queue() returns None.
+    Inference workers must construct their own client from redis_url and call
+    xadd directly. The launcher detects this and passes redis_url through.
     """
 
     def __init__(self, redis_url: str = "redis://localhost", stream_key: str = "rollouts"):
         import redis
+        self.redis_url = redis_url
         self.client = redis.from_url(redis_url, decode_responses=True)
         self.stream_key = stream_key
         self._last_id = "0-0"
+        self._queue = None  # Redis path, not mp.Queue
         # Clear old stream on init
         self.client.delete(self.stream_key)
+
+    def get_producer_queue(self):
+        return None
 
     async def put(self, rollout: ScoredRollout) -> None:
         loop = asyncio.get_event_loop()
@@ -90,6 +96,28 @@ class RedisStreamBuffer(RolloutBuffer):
                 None,
                 lambda: self.client.xread(
                     {self.stream_key: self._last_id}, count=batch_size - len(batch), block=1000
+                ),
+            )
+            if result:
+                for stream_name, messages in result:
+                    for msg_id, data in messages:
+                        batch.append(_dict_to_rollout(data))
+                        self._last_id = msg_id
+        return batch
+
+    async def collect(self, batch_size: int, timeout: float = 120.0) -> List[ScoredRollout]:
+        import time as _t
+        loop = asyncio.get_event_loop()
+        batch = []
+        deadline = _t.time() + timeout
+        while len(batch) < batch_size and _t.time() < deadline:
+            block_ms = int(max(100, min(2000, (deadline - _t.time()) * 1000)))
+            result = await loop.run_in_executor(
+                None,
+                lambda: self.client.xread(
+                    {self.stream_key: self._last_id},
+                    count=batch_size - len(batch),
+                    block=block_ms,
                 ),
             )
             if result:

@@ -1,6 +1,7 @@
 """Orchestrates process launching for async RL training.
 
 Handles:
+  - Creating the shared buffer and interrupt (both need to span processes)
   - Spawning vLLM inference workers (one per inference GPU)
   - Single-GPU training (direct, no FSDP)
   - Multi-GPU training (FSDP via mp.spawn)
@@ -30,8 +31,23 @@ def launch(config: dict):
     from utils.gsm8k import load_gsm8k
     train_data = load_gsm8k("train")
 
-    # Shared state
-    rollout_queue = mp.Queue(maxsize=64 * len(gpu_alloc.infer_gpu_ids))
+    # Build buffer and interrupt BEFORE spawning inference — both carry mp
+    # primitives that need to be shared with inference workers, and both
+    # must exist before the worker processes are forked.
+    buffer = create_buffer(config)
+    interrupt = create_interrupt(config)
+
+    rollout_queue = buffer.get_producer_queue()
+    redis_url = None
+    redis_stream_key = "rollouts"
+    if rollout_queue is None:
+        # Redis path — inference workers push to a redis stream.
+        from buffers.redis_stream import RedisStreamBuffer
+        assert isinstance(buffer, RedisStreamBuffer), \
+            "buffer returned None for producer queue but isn't a RedisStreamBuffer"
+        redis_url = buffer.redis_url
+        redis_stream_key = buffer.stream_key
+
     version_val = mp.Value("i", 0)
     stop_event = mp.Event()
     sync_dir = config["weight_sync"].get("checkpoint_dir", "/tmp/async-rl-lab/checkpoints")
@@ -43,6 +59,9 @@ def launch(config: dict):
     inference_procs = _spawn_inference_workers(
         gpu_alloc.infer_gpu_ids, model_name, dtype_str, config,
         train_data, rollout_queue, version_val, stop_event, sync_dir,
+        interrupt=interrupt,
+        scorer_config=config.get("scorer", {"type": "verifier"}),
+        redis_url=redis_url, redis_stream_key=redis_stream_key,
     )
 
     num_train_gpus = len(gpu_alloc.train_gpu_ids)
@@ -52,15 +71,16 @@ def launch(config: dict):
         if num_train_gpus > 1:
             _launch_fsdp_training(
                 gpu_alloc.train_gpu_ids, config, model_name, dtype,
-                rollout_queue, version_val, stop_event, gpu_alloc.infer_gpu_ids,
+                buffer, interrupt, version_val, stop_event, gpu_alloc.infer_gpu_ids,
             )
         else:
             _launch_single_gpu_training(
                 gpu_alloc.train_device, config, model_name, dtype,
-                rollout_queue, version_val, stop_event, gpu_alloc.infer_gpu_ids,
+                buffer, interrupt, version_val, stop_event, gpu_alloc.infer_gpu_ids,
             )
     finally:
         _cleanup(inference_procs, stop_event)
+        buffer.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -68,14 +88,17 @@ def launch(config: dict):
 # ---------------------------------------------------------------------------
 
 def _spawn_inference_workers(infer_gpu_ids, model_name, dtype_str, config,
-                              train_data, queue, version_val, stop_event, sync_dir):
+                              train_data, queue, version_val, stop_event, sync_dir,
+                              interrupt, scorer_config,
+                              redis_url=None, redis_stream_key="rollouts"):
     """Spawn one vLLM inference process per inference GPU."""
     procs = []
     for i, gpu_id in enumerate(infer_gpu_ids):
         proc = mp.Process(
             target=_inference_worker_target,
             args=(gpu_id, i, model_name, dtype_str, config,
-                  train_data, queue, version_val, stop_event, sync_dir),
+                  train_data, queue, version_val, stop_event, sync_dir,
+                  interrupt, scorer_config, redis_url, redis_stream_key),
         )
         proc.start()
         procs.append(proc)
@@ -84,7 +107,8 @@ def _spawn_inference_workers(infer_gpu_ids, model_name, dtype_str, config,
 
 
 def _inference_worker_target(gpu_id, worker_id, model_name, dtype_str, config,
-                              train_data, queue, version_val, stop_event, sync_dir):
+                              train_data, queue, version_val, stop_event, sync_dir,
+                              interrupt, scorer_config, redis_url, redis_stream_key):
     """Target for inference subprocess. Sets CUDA_VISIBLE_DEVICES then runs vLLM."""
     # Create new process group so we can kill all children (vLLM EngineCore) together
     os.setpgrp()
@@ -107,6 +131,10 @@ def _inference_worker_target(gpu_id, worker_id, model_name, dtype_str, config,
         stop_event=stop_event,
         sync_dir=sync_dir,
         worker_id=worker_id,
+        scorer_config=scorer_config,
+        interrupt=interrupt,
+        redis_url=redis_url,
+        redis_stream_key=redis_stream_key,
     )
 
 
@@ -115,12 +143,9 @@ def _inference_worker_target(gpu_id, worker_id, model_name, dtype_str, config,
 # ---------------------------------------------------------------------------
 
 def _launch_single_gpu_training(train_device, config, model_name, dtype,
-                                 rollout_queue, version_val, stop_event, infer_gpu_ids):
+                                 buffer, interrupt, version_val, stop_event, infer_gpu_ids):
     """Load model on a single GPU and run the coordinator."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from core.coordinator import Coordinator
-    from core.trainer import GRPOTrainer
-    from utils.metrics import MetricsTracker
 
     print(f"\nLoading training model on {train_device}...")
 
@@ -134,7 +159,7 @@ def _launch_single_gpu_training(train_device, config, model_name, dtype,
 
     trainer, coordinator = _build_coordinator(
         model, tokenizer, train_device, config,
-        rollout_queue, version_val, stop_event, infer_gpu_ids,
+        buffer, interrupt, version_val, stop_event, infer_gpu_ids,
     )
     asyncio.run(coordinator.run())
 
@@ -144,21 +169,21 @@ def _launch_single_gpu_training(train_device, config, model_name, dtype,
 # ---------------------------------------------------------------------------
 
 def _launch_fsdp_training(train_gpu_ids, config, model_name, dtype,
-                           rollout_queue, version_val, stop_event, infer_gpu_ids):
+                           buffer, interrupt, version_val, stop_event, infer_gpu_ids):
     """Launch FSDP training across multiple GPUs via mp.spawn."""
     num_gpus = len(train_gpu_ids)
     print(f"\nLaunching FSDP training across {num_gpus} GPUs: {train_gpu_ids}")
     mp.spawn(
         _fsdp_rank_entrypoint,
         args=(num_gpus, train_gpu_ids, config, model_name, dtype,
-              rollout_queue, version_val, stop_event, infer_gpu_ids),
+              buffer, interrupt, version_val, stop_event, infer_gpu_ids),
         nprocs=num_gpus,
         join=True,
     )
 
 
 def _fsdp_rank_entrypoint(rank, world_size, train_gpu_ids, config, model_name, dtype,
-                           rollout_queue, version_val, stop_event, infer_gpu_ids):
+                           buffer, interrupt, version_val, stop_event, infer_gpu_ids):
     """Entry point for each FSDP rank. Rank 0 runs coordinator, others follow."""
     from utils.fsdp import setup_distributed, cleanup_distributed, wrap_model_fsdp
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -190,7 +215,7 @@ def _fsdp_rank_entrypoint(rank, world_size, train_gpu_ids, config, model_name, d
     if rank == 0:
         _, coordinator = _build_coordinator(
             model, tokenizer, device, config,
-            rollout_queue, version_val, stop_event, infer_gpu_ids,
+            buffer, interrupt, version_val, stop_event, infer_gpu_ids,
             trainer=trainer,
         )
         try:
@@ -219,12 +244,12 @@ def _build_wandb_config(config: dict) -> dict:
         "run_name": wandb_cfg.get("run_name"),
         "group": wandb_cfg.get("group"),
         "tags": wandb_cfg.get("tags", []),
-        "config": config,  # Log full experiment config to wandb
+        "config": config,
     }
 
 
 def _build_coordinator(model, tokenizer, device, config,
-                        rollout_queue, version_val, stop_event, infer_gpu_ids,
+                        buffer, interrupt, version_val, stop_event, infer_gpu_ids,
                         trainer=None):
     """Build trainer (if not provided) and coordinator from config."""
     from core.coordinator import Coordinator
@@ -235,17 +260,16 @@ def _build_coordinator(model, tokenizer, device, config,
 
     coordinator = Coordinator(
         config=config, trainer=trainer,
-        buffer=create_buffer(config),
+        buffer=buffer,
         syncer=create_syncer(config),
         staleness=create_staleness(config, model=model, tokenizer=tokenizer, device=device),
-        interrupt=create_interrupt(config),
-        scorer=create_scorer(config),
+        interrupt=interrupt,
+        scorer=create_scorer(config),  # coordinator-side scorer unused but kept for parity
         metrics=MetricsTracker(
             log_every=config.get("metrics", {}).get("log_every", 1),
             output_dir=config.get("metrics", {}).get("plot_dir", "results/"),
             wandb_config=_build_wandb_config(config),
         ),
-        rollout_queue=rollout_queue,
         version_val=version_val,
         stop_event=stop_event,
         infer_gpu_ids=infer_gpu_ids,
@@ -261,7 +285,6 @@ def _cleanup(inference_procs, stop_event):
     for proc in inference_procs:
         proc.join(timeout=15)
         if proc.is_alive():
-            # Kill entire process group (catches vLLM's internal EngineCore subprocess)
             try:
                 os.killpg(proc.pid, sig.SIGTERM)
             except OSError:

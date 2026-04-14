@@ -59,7 +59,7 @@ class VLLMInferenceWorker:
         all_texts = []
         all_prompt_data = []
         for prompt_data in prompts:
-            text = format_prompt(prompt_data["question"])
+            text = format_prompt(prompt_data["question"], tokenizer=self.tokenizer)
             for _ in range(self.group_size):
                 all_texts.append(text)
                 all_prompt_data.append(prompt_data)

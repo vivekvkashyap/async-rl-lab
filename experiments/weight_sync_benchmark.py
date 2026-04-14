@@ -45,7 +45,7 @@ async def benchmark_nccl(model_0, model_1, syncer_class, n_iters: int = 100, **k
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B")
+    parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--n-iters", type=int, default=100)
     parser.add_argument("--output-dir", default="results/")
     args = parser.parse_args()

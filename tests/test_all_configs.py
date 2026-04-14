@@ -290,8 +290,8 @@ def test_soft_drain():
     sd = SoftDrain()
     async def run():
         assert sd.is_accepting
-        # Simulate: begin generation, then try to sync
-        await sd.begin_generation()
+        # Simulate: inference-side begin (sync), then try to sync
+        sd.begin_generation()
 
         sync_done = False
         async def do_sync():
@@ -300,14 +300,13 @@ def test_soft_drain():
             sync_done = True
             await sd.resume_after_sync()
 
-        # Start sync (will wait for drain)
         task = asyncio.create_task(do_sync())
         await asyncio.sleep(0.05)
         assert not sync_done  # Should be waiting for drain
 
-        # End generation — should unblock sync
-        await sd.end_generation()
-        await asyncio.sleep(0.05)
+        # End generation (sync) — should unblock sync
+        sd.end_generation()
+        await asyncio.sleep(0.1)
         assert sync_done
         assert sd.is_accepting
         await task
@@ -319,30 +318,26 @@ def test_implicit_continuation():
     from interrupts.implicit_continuation import ImplicitContinuation
     ic = ImplicitContinuation()
     async def run():
-        # Test forward_pass context manager
+        # In-process forward_pass context manager still works
         async with ic.forward_pass():
-            pass  # Simulates a forward pass
+            pass
 
-        # Test sync waits for forward pass
+        # Simulate inference holding the lock via begin_generation.
+        ic.begin_generation()
+
         sync_acquired = False
-        async def do_forward():
-            async with ic.forward_pass():
-                await asyncio.sleep(0.1)
-
         async def do_sync():
             nonlocal sync_acquired
             await ic.prepare_for_sync()
             sync_acquired = True
             await ic.resume_after_sync()
 
-        # Start forward pass, then try sync
-        fw_task = asyncio.create_task(do_forward())
-        await asyncio.sleep(0.02)
         sync_task = asyncio.create_task(do_sync())
-        await asyncio.sleep(0.02)
-        assert not sync_acquired  # Sync should wait for forward pass
-        await fw_task
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.05)
+        assert not sync_acquired  # sync should be waiting for inference to finish
+
+        ic.end_generation()
+        await asyncio.sleep(0.1)
         assert sync_acquired
         await sync_task
     asyncio.run(run())
@@ -368,7 +363,8 @@ def test_verifier_scorer():
             reward=None,
         )
         scored = await scorer.score(r_correct)
-        assert scored.reward == 1.0
+        # correctness (1.0) + format (0.1 * 1.0) = 1.1
+        assert abs(scored.reward - 1.1) < 1e-6, f"got {scored.reward}"
 
         r_wrong = ScoredRollout(
             prompt="q", prompt_ids=torch.tensor([1]),
@@ -380,7 +376,8 @@ def test_verifier_scorer():
             reward=None,
         )
         scored = await scorer.score(r_wrong)
-        assert scored.reward == 0.0
+        # correctness (0.0) + format (0.1 * 1.0) = 0.1
+        assert abs(scored.reward - 0.1) < 1e-6, f"got {scored.reward}"
     asyncio.run(run())
     print("  [PASS] verifier_scorer")
 

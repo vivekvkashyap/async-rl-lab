@@ -39,23 +39,33 @@ def create_buffer(config: dict):
 
 
 def create_syncer(config: dict):
+    """Build a weight syncer for the main training pipeline.
+
+    Only filesystem and zmq_notify_fs write a safetensors snapshot that
+    vLLM inference can reload via reload_weights(). NCCL variants are
+    benchmark-only (see experiments/weight_sync_benchmark.py) — they're
+    not callable here because they have no path to push weights into a
+    vLLM engine running in a separate process.
+    """
     from weight_sync.filesystem_sync import FilesystemSyncer
     sync_type = config["weight_sync"]["type"]
     if sync_type == "filesystem":
         return FilesystemSyncer(
-            checkpoint_dir=config["weight_sync"].get("checkpoint_dir", "/tmp/async-rl-lab/checkpoints")
+            checkpoint_dir=config["weight_sync"].get("checkpoint_dir", "/tmp/async-rl-lab/checkpoints"),
+            keep_last=config["weight_sync"].get("keep_last", 4),
         )
-    if sync_type == "nccl_broadcast":
-        from weight_sync.nccl_broadcast import NCCLBroadcastSyncer
-        return NCCLBroadcastSyncer(rank=0)
-    if sync_type == "nccl_bucketed":
-        from weight_sync.nccl_bucketed import NCCLBucketedSyncer
-        return NCCLBucketedSyncer(rank=0, bucket_size_mb=config["weight_sync"].get("bucket_size_mb", 1024))
     if sync_type == "zmq_notify_fs":
         from weight_sync.zmq_notify_fs import ZMQNotifyFSSyncer
         return ZMQNotifyFSSyncer(
             checkpoint_dir=config["weight_sync"].get("checkpoint_dir", "/tmp/async-rl-lab/checkpoints"),
             zmq_port=config["weight_sync"].get("zmq_port", 5555), role="publisher",
+        )
+    if sync_type in ("nccl_broadcast", "nccl_bucketed"):
+        raise ValueError(
+            f"weight_sync.type={sync_type!r} is benchmark-only and cannot be used "
+            f"in the main training pipeline (vLLM inference loads weights from "
+            f"disk). Use 'filesystem' or 'zmq_notify_fs' here, and run raw "
+            f"NCCL transfer benchmarks from experiments/weight_sync_benchmark.py."
         )
     raise ValueError(f"Unknown weight_sync type: {sync_type}")
 

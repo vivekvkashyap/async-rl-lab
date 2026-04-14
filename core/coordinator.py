@@ -34,7 +34,6 @@ class Coordinator:
         interrupt: InterruptStrategy,
         scorer: Scorer,
         metrics: MetricsTracker,
-        rollout_queue: mp.Queue,
         version_val: mp.Value,
         stop_event: mp.Event,
         infer_gpu_ids: List[int],
@@ -47,7 +46,6 @@ class Coordinator:
         self.interrupt = interrupt
         self.scorer = scorer
         self.metrics = metrics
-        self.rollout_queue = rollout_queue
         self.version_val = version_val
         self.stop_event = stop_event
         self.infer_gpu_ids = infer_gpu_ids
@@ -61,20 +59,10 @@ class Coordinator:
         self.eval_every = config.get("metrics", {}).get("eval_every", 0)
         self.eval_samples = config.get("metrics", {}).get("eval_samples", 200)
 
-    async def _collect_from_queue(self, needed: int, timeout: float = 120.0) -> List[ScoredRollout]:
-        """Collect rollouts from inference processes via shared queue."""
-        loop = asyncio.get_event_loop()
-        batch = []
-        deadline = time.time() + timeout
-        while len(batch) < needed and time.time() < deadline:
-            try:
-                item = await loop.run_in_executor(
-                    None, lambda: self.rollout_queue.get(timeout=2)
-                )
-                batch.append(item)
-            except Exception:
-                pass
-        return batch
+    async def _collect_from_buffer(self, needed: int, timeout: float = 120.0) -> List[ScoredRollout]:
+        """Collect rollouts from inference via the buffer. Buffer may apply
+        backpressure, prefetching, or reordering depending on its type."""
+        return await self.buffer.collect(needed, timeout=timeout)
 
     def _get_gpu_utilization(self) -> Dict[str, float]:
         """Snapshot GPU compute utilization via pynvml."""
@@ -116,7 +104,7 @@ class Coordinator:
         correct = 0
         total = 0
         for sample in samples:
-            prompt_text = format_prompt(sample["question"])
+            prompt_text = format_prompt(sample["question"], tokenizer=self.trainer.tokenizer)
             inputs = self.trainer.tokenizer(
                 prompt_text, return_tensors="pt", truncation=True, max_length=512
             ).to(self.trainer.device)
@@ -174,22 +162,17 @@ class Coordinator:
         for step in range(self.max_steps):
             step_start = time.time()
 
-            # Collect rollouts from vLLM inference processes
+            # Collect rollouts via the buffer (may apply backpressure/prefetch).
             gen_start = time.time()
-            scored = await self._collect_from_queue(self.batch_size)
+            batch_rollouts = await self._collect_from_buffer(self.batch_size)
             gen_time = time.time() - gen_start
 
-            if not scored:
-                print(f"[step {step}] No rollouts collected, skipping...")
+            if not batch_rollouts:
+                print(f"[step {step}] No rollouts collected within timeout, skipping...")
                 if self.trainer.is_fsdp:
                     signal = torch.zeros(1, dtype=torch.long, device=self.trainer.device)
                     dist.broadcast(signal, src=0)
                 continue
-
-            for s in scored:
-                await self.buffer.put(s)
-
-            batch_rollouts = await self.buffer.get(min(self.batch_size, len(scored)))
 
             # Apply staleness filter/reweight
             batch = self.staleness.process(batch_rollouts, self.trainer.version)
@@ -214,7 +197,9 @@ class Coordinator:
             # Notify inference of new version
             self.version_val.value = self.trainer.version
 
-            # Log metrics
+            # Log metrics. Staleness is computed on the rollouts that were
+            # actually trained on (post-filter), not the pre-filter set.
+            trained_rollouts = batch.rollouts
             step_metrics = {
                 **train_metrics,
                 "generation_time": gen_time,
@@ -223,10 +208,14 @@ class Coordinator:
                 "buffer_depth": self.buffer.size(),
                 "num_infer_gpus": len(self.infer_gpu_ids),
                 "batch_staleness_mean": sum(
+                    self.trainer.version - r.model_version for r in trained_rollouts
+                ) / max(len(trained_rollouts), 1),
+                "batch_staleness_precollect_mean": sum(
                     self.trainer.version - r.model_version for r in batch_rollouts
                 ) / max(len(batch_rollouts), 1),
+                "rollouts_dropped_by_staleness": len(batch_rollouts) - len(trained_rollouts),
                 "tokens_per_second": sum(
-                    r.completion_ids.shape[0] for r in scored
+                    r.completion_ids.shape[0] for r in trained_rollouts
                 ) / max(gen_time, 1e-6),
                 "wall_clock_time": time.time() - step_start,
             }
